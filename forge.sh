@@ -14,7 +14,6 @@ KEEP=""
 LABEL=""
 LUKS=""
 MOUNT=""
-NETWORKS=""
 OUTPUTPATH="./debian"
 PACKAGES=""
 PARTITION=""
@@ -48,7 +47,6 @@ Arguments:
   -la [label]               append a custom label to partition names (default: none)
   -lu [password]            enable LUKS for image
   -m                        mount the disk/image
-  -n [names]                network interface names to configure for DHCP (default: none)
   -o [path]                 output directory (filesystem/squashfs), target disk (disk) or filename without extension (image) (default: ${OUTPUTPATH})
   -pp                       if hardware device requires a partition prefix, like nvme0n1 partition 1 = nvme0n1p1
   -rk [password]            filename for root SSH public key (default: none)
@@ -228,18 +226,16 @@ exit 101
 EOF
 
   # Setup networking
-  for network in ${NETWORKS}; do
-    cat >> "${TEMPDIR}/etc/systemd/network/${network}.network" << EOF
+  cat >> "${TEMPDIR}/etc/systemd/network/default.network" << EOF
 [Match]
-Name=${network}
+Name=ether wlan
 
 [Network]
 DHCP=yes
 EOF
-  done
 
   # Enable timesyncd
-  for service in polkit systemd-networkd systemd-timesyncd; do
+  for service in polkit systemd-networkd systemd-resolved systemd-timesyncd; do
     ln -s "/lib/systemd/system/${service}.service" "${TEMPDIR}/etc/systemd/system/multi-user.target.wants" || true
   done
 
@@ -420,10 +416,6 @@ while [ $# -gt 0 ]; do
     -m)
       MOUNT=yes
       shift 1
-    ;;
-    -n)
-      NETWORKS="${2}"
-      shift 2
     ;;
     -o)
       OUTPUTPATH="${2}"
