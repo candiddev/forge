@@ -6,7 +6,7 @@ ARCH="amd64"
 BINFMT="x86_64"
 BOOTOPTIONS=""
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-EXCLUDE="ifupdown"
+EXCLUDE="cron ifupdown logrotate nano rsyslog"
 IMAGEFORMAT="qcow2"
 IMAGESIZE="10G"
 INSTALLDEPS=""
@@ -49,7 +49,7 @@ Arguments:
   -m                        mount the disk/image
   -o [path]                 output directory (filesystem/squashfs), target disk (disk) or filename without extension (image) (default: ${OUTPUTPATH})
   -pp                       if hardware device requires a partition prefix, like nvme0n1 partition 1 = nvme0n1p1
-  -rk [password]            filename for root SSH public key (default: none)
+  -rk [content]             root SSH public key content (default: none)
   -rp [password]            root password (default: none)
   -sc [content]             SSH CA content (default: none)
   -sp [port]                SSH port (default: 22)
@@ -88,6 +88,7 @@ function provision() {
       parted -s "${diskpath}" mkpart primary 1MiB 2MiB
       parted -s "${diskpath}" set 1 bios_grub on
       parted -s "${diskpath}" mkpart primary 2Mib 202MiB
+      parted -s "${diskpath}" set 2 esp on
       sleep 1
       mkfs.fat -F 32 -n "boot${LABEL}" "${diskpath}${PARTITION}2"
       parted -s "${diskpath}" mkpart primary 202MiB 100%
@@ -131,6 +132,8 @@ function provision() {
       mkfs.ext4 -L "root${LABEL}" "/dev/lvm${LABEL}/root${LABEL}"
     fi
 
+    udevadm trigger
+
     sleep 1
   fi
 }
@@ -141,7 +144,7 @@ function mountfs() {
   # Mount disks if necessary
   if [ "${diskpath}" ]; then
     if ! mount | grep "${TEMPDIR}"; then
-      if [ "${TARGET}" == image ] && [ ! -e "/dev/disk/by-label/${BOOTPARTITION}${LABEL}" ]; then
+      if [ "${TARGET}" == image ] && [ ! -e "/dev/disk/by-label/boot${LABEL}" ]; then
         modprobe nbd max_part=4
         qemu-nbd -c /dev/nbd0 -f "${IMAGEFORMAT}" "${OUTPUTPATH}"
         sleep 1
@@ -156,26 +159,28 @@ function mountfs() {
 
       if [ "${diskpath}" ]; then
         mkdir -p "${TEMPDIR}/boot"
-        mount "/dev/disk/by-label/${BOOTPARTITION}${LABEL}" "${TEMPDIR}/boot"
+        mount "/dev/disk/by-label/boot${LABEL}" "${TEMPDIR}/boot"
       fi
     fi
 
-    mkdir -p "${TEMPDIR}/dev"
-    mount -o bind /dev "${TEMPDIR}/dev"
-    mkdir -p "${TEMPDIR}/proc"
-    mount -t proc /proc "${TEMPDIR}/proc"
-    mkdir -p "${TEMPDIR}/sys"
-    mount -t sysfs /sys "${TEMPDIR}/sys"
+  if [ "${MOUNT}" ]; then
+      mkdir -p "${TEMPDIR}/dev"
+      mount -o bind /dev "${TEMPDIR}/dev"
+      mkdir -p "${TEMPDIR}/proc"
+      mount -t proc /proc "${TEMPDIR}/proc"
+      mkdir -p "${TEMPDIR}/sys"
+      mount -t sysfs /sys "${TEMPDIR}/sys"
+    fi
   fi
 }
 
 function install() {
-  PACKAGES="ca-certificates,console-setup,curl,dbus,jq,locales,policykit-1,ssh,${PACKAGES}"
+  PACKAGES="ca-certificates,console-setup,curl,dbus,jq,libpam-systemd,locales,policykit-1,ssh,${PACKAGES}"
   kernelarch=${ARCH}
 
   if [ "${diskpath}" ]; then
     BOOTOPTIONS="root=LABEL=root${LABEL} ${BOOTOPTIONS}"
-    PACKAGES="console-setup,dosfstools,grub2-common,grub-pc,linux-image-${kernelarch},lvm2,${PACKAGES}"
+    PACKAGES="console-setup,dosfstools,grub-cloud-amd64,linux-image-${kernelarch},lvm2,${PACKAGES}"
 
     if [ "${SWAPSIZE}" ]; then
       BOOTOPTIONS="resume=LABEL=swap${LABEL} ${BOOTOPTIONS}"
@@ -228,7 +233,8 @@ EOF
   # Setup networking
   cat >> "${TEMPDIR}/etc/systemd/network/default.network" << EOF
 [Match]
-Name=ether wlan
+Name=!veth*
+Type=ether wlan
 
 [Network]
 DHCP=yes
@@ -237,6 +243,7 @@ EOF
   # Enable timesyncd
   for service in polkit systemd-networkd systemd-resolved systemd-timesyncd; do
     ln -s "/lib/systemd/system/${service}.service" "${TEMPDIR}/etc/systemd/system/multi-user.target.wants" || true
+    ln -sf /var/run/systemd/resolve/resolv.conf "${TEMPDIR}/etc/resolv.conf" || true
   done
 
   # Remove timers
@@ -269,9 +276,13 @@ function finalize() {
   chroot "${TEMPDIR}" apt clean
 
   if [ "${diskpath}" ]; then
+      mount -o bind /dev "${TEMPDIR}/dev"
+      mount -t proc /proc "${TEMPDIR}/proc"
+      mount -t sysfs /sys "${TEMPDIR}/sys"
+
       sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"${BOOTOPTIONS}\"/" ${TEMPDIR}/etc/default/grub
       chroot "${TEMPDIR}" grub-install --target=i386-pc "${diskpath}" || true
-      chroot "${TEMPDIR}" grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=Debian "${diskpath}" || true
+      chroot "${TEMPDIR}" grub-install --target=x86_64-efi --efi-directory=/boot --removable --no-uefi-secure-boot || true
       chroot "${TEMPDIR}" grub-mkconfig > "${TEMPDIR}/boot/grub/grub.cfg" || true
       cat > "${TEMPDIR}/etc/fstab" << EOF
 LABEL=boot${LABEL} /boot vfat defaults 0 0
@@ -502,7 +513,11 @@ if ! [ -x "$(command -v lvm)" ]; then
   INSTALLDEPS+=" lvm2"
 fi
 
-if [ "${EFI}" ] && ! [ -x "$(command -v parted)" ]; then
+if ! [ -x "$(command -v mkfs.fat)" ]; then
+  INSTALLDEPS+=" dosfstools"
+fi
+
+if ! [ -x "$(command -v parted)" ]; then
   INSTALLDEPS+=" parted"
 fi
 
