@@ -5,7 +5,6 @@ APTCACHER=""
 ARCH="amd64"
 BINFMT="x86_64"
 BOOTOPTIONS=""
-BOOTPARTITION="boot"
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 EXCLUDE="ifupdown"
 IMAGEFORMAT="qcow2"
@@ -13,7 +12,6 @@ IMAGESIZE="10G"
 INSTALLDEPS=""
 KEEP=""
 LABEL=""
-LOADER="efi"
 LUKS=""
 MOUNT=""
 NETWORKS=""
@@ -40,9 +38,7 @@ Arguments:
   -ac [apt-cacher-address]  apt-cacher-ng proxy
   -ap [packages]            additional packages to include (default: none)
   -ar [architecture]        architecture (amd64, arm64) (default: ${ARCH})
-  -bl                       bootloader (bios, efi) (default: ${LOADER})
   -bo                       boot options (default: root=)
-  -bp                       boot partition name (default: ${BOOTPARTITION})
   -d                        enable debugging
   -e                        exclude packages (default: ${EXCLUDE})
   -h                        show help
@@ -89,38 +85,21 @@ function provision() {
 
   # Create partitions
   if [ "${diskpath}" ]; then
-    if [ ! -e "/dev/disk/by-label/${BOOTPARTITION}${LABEL}" ]; then
-      case "${LOADER}" in
-        bios)
-          parted -s "${diskpath}" mklabel gpt
-          parted -s "${diskpath}" mkpart primary 1MiB 2MiB
-          parted -s "${diskpath}" set 1 bios_grub on
-          parted -s "${diskpath}" mkpart primary 2Mib 202MiB
-          sleep 1
-          mkfs.ext4 -L "${BOOTPARTITION}${LABEL}" "${diskpath}${PARTITION}2"
-          parted -s "${diskpath}" mkpart primary 202MiB 100%
-          sleep 1
-        ;;
-        efi)
-          parted -s "${diskpath}" mklabel gpt
-          parted -s "${diskpath}" mkpart primary 1MiB 200MiB
-          parted -s "${diskpath}" set 1 esp on
-          sleep 1
-          mkfs.fat -F 32 -n "${BOOTPARTITION}${LABEL}" "${diskpath}${PARTITION}1"
-          parted -s "${diskpath}" mkpart primary 200MiB 100%
-          sleep 1
-        ;;
-      esac
+    if [ ! -e "/dev/disk/by-label/boot${LABEL}" ]; then
+      parted -s "${diskpath}" mklabel gpt
+      parted -s "${diskpath}" mkpart primary 1MiB 2MiB
+      parted -s "${diskpath}" set 1 bios_grub on
+      parted -s "${diskpath}" mkpart primary 2Mib 202MiB
+      sleep 1
+      mkfs.fat -F 32 -n "boot${LABEL}" "${diskpath}${PARTITION}2"
+      parted -s "${diskpath}" mkpart primary 202MiB 100%
+      sleep 1
     fi
 
     # Setup LUKS if specified
     if [ "${LUKS}" ]; then
       if [ ! -e "/dev/disk/by-label/luks${LABEL}" ]; then
-        if [ "${LOADER}" == efi ]; then
-          echo "${LUKS}" | cryptsetup --label "luks${LABEL}" -v luksFormat --type luks2 "${diskpath}${PARTITION}2"
-        else
-          echo "${LUKS}" | cryptsetup --label "luks${LABEL}" -v luksFormat --type luks2 "${diskpath}${PARTITION}3"
-        fi
+        echo "${LUKS}" | cryptsetup --label "luks${LABEL}" -v luksFormat --type luks2 "${diskpath}${PARTITION}3"
 
         sleep 1
       fi
@@ -136,7 +115,7 @@ function provision() {
       if [ "${LUKS}" ]; then
         vgcreate "lvm${LABEL}" "/dev/mapper/luks${LABEL}"
       else
-        vgcreate "lvm${LABEL}" "${diskpath}${PARTITION}2"
+        vgcreate "lvm${LABEL}" "${diskpath}${PARTITION}3"
       fi
     fi
 
@@ -178,16 +157,8 @@ function mountfs() {
       mount "/dev/disk/by-label/root${LABEL}" "${TEMPDIR}"
 
       if [ "${diskpath}" ]; then
-        case "${LOADER}" in
-          bios)
-            mkdir -p "${TEMPDIR}/boot"
-            mount "/dev/disk/by-label/${BOOTPARTITION}${LABEL}" "${TEMPDIR}/boot"
-          ;;
-          efi)
-            mkdir -p "${TEMPDIR}/boot/${BOOTPARTITION}"
-            mount "/dev/disk/by-label/${BOOTPARTITION}${LABEL}" "${TEMPDIR}/boot/${BOOTPARTITION}"
-          ;;
-        esac
+        mkdir -p "${TEMPDIR}/boot"
+        mount "/dev/disk/by-label/${BOOTPARTITION}${LABEL}" "${TEMPDIR}/boot"
       fi
     fi
 
@@ -206,11 +177,7 @@ function install() {
 
   if [ "${diskpath}" ]; then
     BOOTOPTIONS="root=LABEL=root${LABEL} ${BOOTOPTIONS}"
-    PACKAGES="console-setup,dosfstools,linux-image-${kernelarch},lvm2,${PACKAGES}"
-
-    if [ "${LOADER}" == bios ]; then
-      PACKAGES="grub2-common,grub-pc,${PACKAGES}"
-    fi
+    PACKAGES="console-setup,dosfstools,grub2-common,grub-pc,linux-image-${kernelarch},lvm2,${PACKAGES}"
 
     if [ "${SWAPSIZE}" ]; then
       BOOTOPTIONS="resume=LABEL=swap${LABEL} ${BOOTOPTIONS}"
@@ -306,55 +273,20 @@ function finalize() {
   chroot "${TEMPDIR}" apt clean
 
   if [ "${diskpath}" ]; then
-    case "${LOADER}" in
-      bios)
-        sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"${BOOTOPTIONS}\"/" ${TEMPDIR}/etc/default/grub
-        chroot "${TEMPDIR}" grub-install "${diskpath}" || true
-        chroot "${TEMPDIR}" grub-mkconfig > "${TEMPDIR}/boot/grub/grub.cfg" || true
-        cat > "${TEMPDIR}/etc/fstab" << EOF
-LABEL=${BOOTPARTITION}${LABEL} /boot ext4 defaults 0 0
+      sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT=\"${BOOTOPTIONS}\"/" ${TEMPDIR}/etc/default/grub
+      chroot "${TEMPDIR}" grub-install --target=i386-pc "${diskpath}" || true
+      chroot "${TEMPDIR}" grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=Debian "${diskpath}" || true
+      chroot "${TEMPDIR}" grub-mkconfig > "${TEMPDIR}/boot/grub/grub.cfg" || true
+      cat > "${TEMPDIR}/etc/fstab" << EOF
+LABEL=boot${LABEL} /boot vfat defaults 0 0
+LABEL=root${LABEL} / ext4 defaults 0 0
 EOF
-      ;;
-      efi)
-        cat > "${TEMPDIR}/etc/fstab" << EOF
-LABEL=${BOOTPARTITION}${LABEL} /boot/${BOOTPARTITION} vfat defaults 0 0
-EOF
-    # Copy initramfs and kernel
-        mkdir -p "${TEMPDIR}/etc/initramfs/post-update.d/"
-        cat > "${TEMPDIR}/etc/initramfs/post-update.d/loader" << EOF
-#!/usr/bin/env bash
-
-cp -fv /{vmlinuz,initrd.img} /boot/${BOOTPARTITION}/
-EOF
-        chmod +x "${TEMPDIR}/etc/initramfs/post-update.d/loader"
-
-        # Setup systemd-bootd
-        if [ ! -e "${TEMPDIR}/boot/${BOOTPARTITION}/EFI" ]; then
-          chroot "${TEMPDIR}" bootctl --esp-path /boot/${BOOTPARTITION} install || true
-        fi
-
-        cat > "${TEMPDIR}/boot/${BOOTPARTITION}/loader/loader.conf" << EOF
-default debian
-timeout 3
-EOF
-        cat > "${TEMPDIR}/boot/${BOOTPARTITION}/loader/entries/debian.conf" << EOF
-title Debian ${VERSION}
-linux /vmlinuz
-initrd /initrd.img
-options ${BOOTOPTIONS}
-EOF
-      ;;
-    esac
 
     if [ "${LUKS}" ]; then
       cat >> "${TEMPDIR}/etc/crypttab" << EOF
 luks LABEL=luks${LABEL} none luks,initramfs,keyscript=decrypt_keyctl
 EOF
     fi
-
-    cat >> "${TEMPDIR}/etc/fstab" << EOF
-LABEL=root${LABEL} / ext4 defaults 0 0
-EOF
 
     if [ "${SWAPSIZE}" ]; then
       cat >> "${TEMPDIR}/etc/fstab" << EOF
@@ -442,22 +374,8 @@ while [ $# -gt 0 ]; do
       esac
       shift 2
     ;;
-    -bl)
-      case "${2}" in
-        bios)
-          LOADER=bios
-        ;;
-        efi)
-        ;;
-      esac
-      shift 2
-    ;;
     -bo)
       BOOTOPTIONS="${2}"
-      shift 2
-    ;;
-    -bp)
-      BOOTPARTITION="${2}"
       shift 2
     ;;
     -d)
